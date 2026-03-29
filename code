@@ -1,0 +1,367 @@
+import warnings
+warnings.filterwarnings("ignore")
+
+import os
+import re
+import time
+import numpy  as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import kagglehub
+
+from sklearn.model_selection  import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes      import MultinomialNB
+from sklearn.linear_model     import LogisticRegression
+from sklearn.svm              import LinearSVC
+from sklearn.pipeline         import Pipeline
+from sklearn.metrics          import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, confusion_matrix,
+    classification_report, roc_curve, ConfusionMatrixDisplay,
+)
+from sklearn.calibration      import CalibratedClassifierCV
+
+print("=" * 60)
+print("  SMS SPAM CLASSIFIER — UCI SMS Spam Collection")
+print("=" * 60)
+
+print("\n[1/6] Downloading dataset from Kaggle …")
+path = kagglehub.dataset_download("uciml/sms-spam-collection-dataset")
+print(f"      Saved to: {path}")
+
+csv_file = None
+for root, _, files in os.walk(path):
+    for f in files:
+        if f.endswith(".csv"):
+            csv_file = os.path.join(root, f)
+            break
+    if csv_file:
+        break
+
+if csv_file is None:
+    raise FileNotFoundError("Could not locate a CSV file in the downloaded dataset.")
+
+df = pd.read_csv(csv_file, encoding="latin-1")[["v1", "v2"]]
+df.columns = ["label", "message"]
+print(f"      Loaded {len(df):,} messages  "
+      f"(spam={df.label.eq('spam').sum():,}  "
+      f"ham={df.label.eq('ham').sum():,})")
+
+print("\n[2/6] Pre-processing …")
+
+def clean_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"http\S+|www\.\S+",       " url ",   text)
+    text = re.sub(r"\b\d[\d\s\-]{6,}\d\b",   " phone ", text)
+    text = re.sub(r"[^a-z\s]",               " ",       text)
+    text = re.sub(r"\s+",                    " ",       text).strip()
+    return text
+
+df["clean"]     = df["message"].apply(clean_text)
+df["label_bin"] = (df["label"] == "spam").astype(int)
+
+df["msg_len"]     = df["message"].str.len()
+df["word_count"]  = df["message"].str.split().str.len()
+df["num_caps"]    = df["message"].str.count(r"[A-Z]")
+df["num_digits"]  = df["message"].str.count(r"\d")
+df["num_exclaim"] = df["message"].str.count(r"!")
+df["has_url"]     = df["message"].str.contains(r"http|www", case=False).astype(int)
+df["has_currency"]= df["message"].str.contains(r"£|\$|€", case=False).astype(int)
+
+print("      Feature engineering complete.")
+
+print("\n[3/6] Splitting data (80 / 20, stratified) …")
+X_train, X_test, y_train, y_test = train_test_split(
+    df["clean"], df["label_bin"],
+    test_size=0.20, random_state=42, stratify=df["label_bin"]
+)
+print(f"      Train: {len(X_train):,}   Test: {len(X_test):,}")
+
+print("\n[4/6] Training models …")
+
+TFIDF = dict(
+    analyzer    = "word",
+    ngram_range = (1, 2),
+    max_features= 15_000,
+    sublinear_tf= True,
+    min_df      = 2,
+    strip_accents= "unicode",
+    token_pattern= r"(?u)\b[a-z]{2,}\b",
+)
+
+pipelines = {
+    "Naive Bayes": Pipeline([
+        ("tfidf", TfidfVectorizer(**TFIDF)),
+        ("clf",   MultinomialNB(alpha=0.1)),
+    ]),
+    "Logistic Regression": Pipeline([
+        ("tfidf", TfidfVectorizer(**TFIDF)),
+        ("clf",   LogisticRegression(C=5.0, max_iter=1000, random_state=42)),
+    ]),
+    "SVM": Pipeline([
+        ("tfidf", TfidfVectorizer(**TFIDF)),
+        ("clf",   CalibratedClassifierCV(LinearSVC(C=1.0, max_iter=2000), cv=3)),
+    ]),
+}
+
+results  = {}
+cv       = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+for name, pipe in pipelines.items():
+    t0 = time.time()
+    pipe.fit(X_train, y_train)
+    train_time = time.time() - t0
+
+    y_pred  = pipe.predict(X_test)
+    y_prob  = pipe.predict_proba(X_test)[:, 1]
+    cv_f1   = cross_val_score(pipe, df["clean"], df["label_bin"],
+                              cv=cv, scoring="f1").mean()
+
+    results[name] = {
+        "model":      pipe,
+        "accuracy":   accuracy_score(y_test, y_pred),
+        "precision":  precision_score(y_test, y_pred),
+        "recall":     recall_score(y_test, y_pred),
+        "f1":         f1_score(y_test, y_pred),
+        "roc_auc":    roc_auc_score(y_test, y_prob),
+        "cv_f1":      cv_f1,
+        "y_pred":     y_pred,
+        "y_prob":     y_prob,
+        "train_time": train_time,
+    }
+    print(f"      {name:22s}  acc={results[name]['accuracy']:.4f}  "
+          f"f1={results[name]['f1']:.4f}  "
+          f"auc={results[name]['roc_auc']:.4f}  "
+          f"({train_time:.2f}s)")
+
+
+print("\n[5/6] Generating plots …")
+
+fig = plt.figure(figsize=(22, 20))
+fig.patch.set_facecolor("#F8F7F4")
+
+COLORS = {
+    "Naive Bayes":        "#378ADD",
+    "Logistic Regression":"#1D9E75",
+    "SVM":                "#D85A30",
+    "spam":               "#E24B4A",
+    "ham":                "#639922",
+}
+GRID_COLOR  = "#E5E3DE"
+TEXT_COLOR  = "#2C2C2A"
+PANEL_COLOR = "#FFFFFF"
+
+def panel(ax):
+    ax.set_facecolor(PANEL_COLOR)
+    for sp in ax.spines.values():
+        sp.set_color(GRID_COLOR)
+    ax.tick_params(colors=TEXT_COLOR, labelsize=9)
+    ax.title.set_color(TEXT_COLOR)
+    return ax
+
+ax1 = panel(fig.add_subplot(4, 4, 1))
+counts = df["label"].value_counts()
+bars   = ax1.bar(counts.index, counts.values,
+                 color=[COLORS["ham"], COLORS["spam"]], width=0.5)
+for bar, val in zip(bars, counts.values):
+    ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 30,
+             f"{val:,}", ha="center", va="bottom", fontsize=9, color=TEXT_COLOR)
+ax1.set_title("Class Distribution", fontsize=11, fontweight="bold", pad=8)
+ax1.set_ylabel("Count", fontsize=9)
+ax1.yaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax1.set_axisbelow(True)
+
+ax2 = panel(fig.add_subplot(4, 4, 2))
+for lbl in ["ham", "spam"]:
+    subset = df[df["label"] == lbl]["msg_len"]
+    ax2.hist(subset, bins=40, alpha=0.65,
+             color=COLORS[lbl], label=lbl, edgecolor="white", linewidth=0.4)
+ax2.set_title("Message Length", fontsize=11, fontweight="bold", pad=8)
+ax2.set_xlabel("Characters", fontsize=9)
+ax2.legend(fontsize=8)
+ax2.yaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax2.set_axisbelow(True)
+
+ax3 = panel(fig.add_subplot(4, 4, 3))
+metrics      = ["accuracy", "precision", "recall", "f1", "roc_auc"]
+metric_labels= ["Accuracy", "Precision", "Recall", "F1", "AUC"]
+x = np.arange(len(metrics))
+width = 0.25
+for i, (name, res) in enumerate(results.items()):
+    vals = [res[m] for m in metrics]
+    bars = ax3.bar(x + i*width - width, vals, width,
+                   label=name, color=COLORS[name], alpha=0.85)
+ax3.set_xticks(x)
+ax3.set_xticklabels(metric_labels, fontsize=8)
+ax3.set_ylim(0.90, 1.01)
+ax3.set_title("Model Performance Metrics", fontsize=11, fontweight="bold", pad=8)
+ax3.legend(fontsize=7, loc="lower right")
+ax3.yaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax3.set_axisbelow(True)
+
+ax4 = panel(fig.add_subplot(4, 4, 4))
+names_  = list(results.keys())
+cv_f1s_ = [results[n]["cv_f1"] for n in names_]
+bars4   = ax4.bar(names_, cv_f1s_,
+                  color=[COLORS[n] for n in names_], width=0.5, alpha=0.85)
+for bar, val in zip(bars4, cv_f1s_):
+    ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+             f"{val:.4f}", ha="center", va="bottom", fontsize=9, color=TEXT_COLOR)
+ax4.set_ylim(0.93, 1.005)
+ax4.set_title("5-Fold CV F1 Score", fontsize=11, fontweight="bold", pad=8)
+ax4.yaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax4.set_axisbelow(True)
+ax4.tick_params(axis="x", labelsize=8)
+
+for idx, (name, res) in enumerate(results.items()):
+    ax = panel(fig.add_subplot(4, 4, 5 + idx))
+    cm = confusion_matrix(y_test, res["y_pred"])
+    disp = ConfusionMatrixDisplay(cm, display_labels=["Ham", "Spam"])
+    disp.plot(ax=ax, colorbar=False, cmap="Blues")
+    ax.set_title(f"Confusion Matrix\n{name}", fontsize=10, fontweight="bold", pad=6)
+    ax.tick_params(labelsize=9)
+
+ax8 = panel(fig.add_subplot(4, 4, 8))
+for name, res in results.items():
+    fpr, tpr, _ = roc_curve(y_test, res["y_prob"])
+    ax8.plot(fpr, tpr, lw=2, color=COLORS[name],
+             label=f"{name} (AUC={res['roc_auc']:.4f})")
+ax8.plot([0, 1], [0, 1], "k--", lw=1, alpha=0.5)
+ax8.set_xlabel("False Positive Rate", fontsize=9)
+ax8.set_ylabel("True Positive Rate", fontsize=9)
+ax8.set_title("ROC Curves", fontsize=11, fontweight="bold", pad=8)
+ax8.legend(fontsize=7)
+ax8.grid(color=GRID_COLOR, linewidth=0.7)
+
+ax9 = panel(fig.add_subplot(4, 4, (9, 10)))
+lr_pipe   = results["Logistic Regression"]["model"]
+tfidf_vec = lr_pipe.named_steps["tfidf"]
+lr_clf    = lr_pipe.named_steps["clf"]
+feat_names = np.array(tfidf_vec.get_feature_names_out())
+coefs      = lr_clf.coef_[0]
+top_n      = 20
+top_idx    = np.argsort(coefs)[-top_n:][::-1]
+top_words  = feat_names[top_idx]
+top_coefs  = coefs[top_idx]
+colors_bar = [COLORS["spam"] if c > 0 else COLORS["ham"] for c in top_coefs]
+ax9.barh(range(top_n), top_coefs[::-1], color=colors_bar[::-1], alpha=0.85)
+ax9.set_yticks(range(top_n))
+ax9.set_yticklabels(top_words[::-1], fontsize=8)
+ax9.set_title("Top 20 Spam Indicators (LR Coefficients)", fontsize=11,
+              fontweight="bold", pad=8)
+ax9.set_xlabel("Coefficient weight", fontsize=9)
+ax9.xaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax9.set_axisbelow(True)
+
+ax10 = panel(fig.add_subplot(4, 4, (11, 12)))
+bot_idx    = np.argsort(coefs)[:top_n]
+bot_words  = feat_names[bot_idx]
+bot_coefs  = coefs[bot_idx]
+ax10.barh(range(top_n), np.abs(bot_coefs[::-1]),
+          color=COLORS["ham"], alpha=0.85)
+ax10.set_yticks(range(top_n))
+ax10.set_yticklabels(bot_words[::-1], fontsize=8)
+ax10.set_title("Top 20 Ham Indicators (LR Coefficients)", fontsize=11,
+               fontweight="bold", pad=8)
+ax10.set_xlabel("|Coefficient weight|", fontsize=9)
+ax10.xaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax10.set_axisbelow(True)
+
+ax11 = panel(fig.add_subplot(4, 4, (13, 14)))
+best_name = max(results, key=lambda n: results[n]["f1"])
+y_prob_best = results[best_name]["y_prob"]
+for lbl, col in [(0, COLORS["ham"]), (1, COLORS["spam"])]:
+    mask = y_test == lbl
+    ax11.hist(y_prob_best[mask], bins=40, alpha=0.65, color=col,
+              label=f"{'Spam' if lbl else 'Ham'} (true)", edgecolor="white", linewidth=0.4)
+ax11.axvline(0.5, color="#888", linewidth=1.5, linestyle="--", label="threshold=0.5")
+ax11.set_title(f"Predicted Probability Distribution\n({best_name})",
+               fontsize=11, fontweight="bold", pad=8)
+ax11.set_xlabel("P(spam)", fontsize=9)
+ax11.legend(fontsize=8)
+ax11.yaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax11.set_axisbelow(True)
+
+ax12 = panel(fig.add_subplot(4, 4, 15))
+train_times = [results[n]["train_time"] for n in names_]
+bars12 = ax12.bar(names_, train_times,
+                  color=[COLORS[n] for n in names_], width=0.5, alpha=0.85)
+for bar, val in zip(bars12, train_times):
+    ax12.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.002,
+              f"{val:.2f}s", ha="center", va="bottom", fontsize=9, color=TEXT_COLOR)
+ax12.set_title("Training Time (seconds)", fontsize=11, fontweight="bold", pad=8)
+ax12.yaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax12.set_axisbelow(True)
+ax12.tick_params(axis="x", labelsize=8)
+
+ax13 = panel(fig.add_subplot(4, 4, 16))
+data_ham  = df[df["label"] == "ham"]["word_count"]
+data_spam = df[df["label"] == "spam"]["word_count"]
+bp = ax13.boxplot([data_ham, data_spam], labels=["Ham", "Spam"],
+                  patch_artist=True, widths=0.4,
+                  medianprops=dict(color=TEXT_COLOR, linewidth=2))
+bp["boxes"][0].set_facecolor(COLORS["ham"] + "AA")
+bp["boxes"][1].set_facecolor(COLORS["spam"] + "AA")
+ax13.set_title("Word Count Distribution", fontsize=11, fontweight="bold", pad=8)
+ax13.set_ylabel("Words per message", fontsize=9)
+ax13.yaxis.grid(True, color=GRID_COLOR, linewidth=0.7)
+ax13.set_axisbelow(True)
+
+fig.suptitle(
+    "SMS Spam Classifier  ·  TF-IDF  +  Naive Bayes / Logistic Regression / SVM",
+    fontsize=14, fontweight="bold", color=TEXT_COLOR, y=0.995
+)
+plt.tight_layout(rect=[0, 0, 1, 0.993])
+
+out_path = "sms_spam_results.png"
+plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+print(f"      Plot saved → {out_path}")
+
+print("\n[6/6] Final results\n")
+print("-" * 72)
+print(f"{'Model':<22} {'Acc':>7} {'Prec':>7} {'Rec':>7} {'F1':>7} "
+      f"{'AUC':>7} {'CV-F1':>7}")
+print("-" * 72)
+for name, res in results.items():
+    print(f"{name:<22} "
+          f"{res['accuracy']:>7.4f} "
+          f"{res['precision']:>7.4f} "
+          f"{res['recall']:>7.4f} "
+          f"{res['f1']:>7.4f} "
+          f"{res['roc_auc']:>7.4f} "
+          f"{res['cv_f1']:>7.4f}")
+print("-" * 72)
+
+
+best = max(results, key=lambda n: results[n]["f1"])
+print(f"\n  Best model by F1: {best}  (F1={results[best]['f1']:.4f})")
+print("\n  Classification report:\n")
+print(classification_report(y_test, results[best]["y_pred"],
+                             target_names=["Ham", "Spam"]))
+
+test_messages = [
+    "WINNER!! As a valued network customer you have been selected to receive "
+    "a £900 prize reward! To claim call 09061701461.",
+    "Hey, are you free this weekend? We should catch up over coffee.",
+    "FREE entry in 2 a weekly comp to win FA Cup Final tkts! "
+    "Txt FA to 87121 to receive entry question.",
+    "I'll be home around 7. Should I pick up dinner on the way?",
+    "Urgent! You have won a 1 week FREE membership in our £100,000 "
+    "prize Jackpot! Txt the word: CLAIM to No: 81010.",
+    "Just a reminder that your 3pm appointment is confirmed for tomorrow.",
+]
+
+best_pipe = results[best]["model"]
+print("\n  Live predictions (best model):")
+print("  " + "-" * 62)
+for msg in test_messages:
+    cleaned = clean_text(msg)
+    pred    = best_pipe.predict([cleaned])[0]
+    prob    = best_pipe.predict_proba([cleaned])[0][1]
+    verdict = "SPAM" if pred == 1 else "HAM "
+    print(f"  [{verdict}  {prob:.2%}]  {msg[:65]}{'…' if len(msg) > 65 else ''}")
+print("  " + "-" * 62)
+print("\nDone. See sms_spam_results.png for the full analysis dashboard.")
